@@ -789,6 +789,9 @@ fn init_refuses_v16_migration_while_an_external_process_holds_the_database() {
     );
 }
 
+// `/tmp` 是 Unix 一级系统目录；在 Windows 上它解析为当前盘符根下的合法用户目录，
+// 不会被拒绝，所以这个用例只在 Unix 上有意义。
+#[cfg(unix)]
 #[test]
 #[serial_test::serial]
 fn init_rejects_unsafe_config_dir() {

@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::io::Write;
+#[cfg(windows)]
+use std::path::Prefix;
 use std::path::{Component, Path, PathBuf};
 
 use crate::error::AppError;
@@ -194,7 +196,8 @@ fn is_system_dir(path: &Path) -> bool {
         return true;
     }
 
-    // 一级系统目录
+    // 一级系统目录（Unix 语义；在 Windows 上这些形如 `/etc` 的输入会被解析为
+    // 当前盘符的根相对路径，同样按系统目录拒绝，保持与 Unix 一致的行为）
     #[cfg(unix)]
     {
         const SYSTEM_DIRS: &[&str] = &[
@@ -224,11 +227,102 @@ fn is_system_dir(path: &Path) -> bool {
         }
     }
 
-    // Windows: 盘符根目录（如 C:\）
+    // Windows: 盘符根目录（如 `C:\`）、无盘符的根相对系统目录（如 `\Windows`），
+    // 以及 Windows 系统目录本体（`C:\Windows`、`Program Files` 等）。
+    // 注意：不照搬 Unix 的 `/etc`、`/tmp` 等名单——Windows 有自己的系统目录语义，
+    // 而 `/tmp/xxx` 这类合法的用户目录在 Windows 上会解析为当前盘符根下的路径，
+    // 不能按一级目录名误判。
     #[cfg(windows)]
     {
-        // Should do some more verifications here
+        if is_windows_system_dir(path) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Windows 系统目录判断。
+///
+/// 覆盖：
+/// 1. 盘符根目录（`C:\`）与裸根（`\`）——直接拒绝；
+/// 2. Windows 系统目录本体：`%SystemRoot%`（通常为 `C:\Windows`）、`%ProgramFiles%`、
+///    `%ProgramFiles(x86)%`，优先读环境变量，读不到再回落常见默认值。
+///
+/// 盘符根相对路径（如 `\tmp\foo`）只按上面的第 1 条判根，不按 Unix 一级目录名
+/// 误判其子路径。
+#[cfg(windows)]
+fn is_windows_system_dir(path: &Path) -> bool {
+    // 提取盘符字母与 Normal 组件序列，忽略 verbatim/device 前缀与分隔符差异，
+    // 使 `C:\Windows`、`\\\\?\\C:\Windows`、`c:/windows` 视为同一路径。
+    fn split(path: &Path) -> (Option<u8>, Vec<std::ffi::OsString>) {
+        let mut drive = None;
+        let mut names = Vec::new();
+        for c in path.components() {
+            match c {
+                Component::Prefix(p) => {
+                    if let Prefix::Disk(b) | Prefix::VerbatimDisk(b) = p.kind() {
+                        drive = Some(b.to_ascii_lowercase());
+                    }
+                }
+                Component::Normal(n) => names.push(n.to_os_string()),
+                _ => {}
+            }
+        }
+        (drive, names)
+    }
+
+    let (drive, names) = split(path);
+    if names.is_empty() {
+        // 盘符根（`C:\`）或裸根（`\`）：只要路径被认作根就拒绝。
+        return path.has_root() || drive.is_some();
+    }
+
+    // 只对「盘符 + 根分隔符」开头的绝对路径（`C:\...`、`C:/...`、`\\\\?\\C:\...`）做系统目录匹配。
+    // 相对路径（`Windows\foo`）与盘符相对路径（`C:Windows\foo`）由 resolve_config_dir 结合进程
+    // 当前目录解析成绝对路径后再判，这里直接放行，避免误杀普通子目录。
+    let raw = path.as_os_str().to_string_lossy();
+    let raw = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    let bytes = raw.as_bytes();
+    let is_drive_rooted = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/');
+    if !is_drive_rooted {
         return false;
+    }
+
+    // Windows 系统目录本体（含子路径）：优先读环境变量（支持定制安装，如 `D:\OS\Windows`），
+    // 读不到回落到常见默认值。按完整组件前缀比较（不照搬 Unix 的 `/etc`、`/tmp` 名单——
+    // `/tmp/xxx` 在 Windows 上是合法的用户目录）。
+    for (var, default) in [
+        ("SYSTEMROOT", r"C:\Windows"),
+        ("WINDIR", r"C:\Windows"),
+        ("PROGRAMFILES", r"C:\Program Files"),
+        ("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
+    ] {
+        let value = env::var(var).unwrap_or_else(|_| default.to_string());
+        let value = value.trim().trim_end_matches(['\\', '/']);
+        let (sys_drive, sys_names) = split(Path::new(value));
+        if sys_names.is_empty() {
+            continue;
+        }
+        // 双方都有盘符时要求一致；系统目录无盘符（不应发生）则跳过。
+        let (Some(td), Some(sd)) = (drive, sys_drive) else {
+            continue;
+        };
+        if td != sd {
+            continue;
+        }
+        // 目标路径的组件序列以系统目录的组件序列为前缀（大小写不敏感）。
+        if names.len() >= sys_names.len()
+            && names
+                .iter()
+                .zip(sys_names.iter())
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
+        {
+            return true;
+        }
     }
 
     false
@@ -953,9 +1047,13 @@ mod tests {
     #[test]
     fn validate_config_dir_ok_for_normal_path() {
         let _guard = lock_test_home_and_settings();
+        // 用一个真实存在的临时目录的父级作为配置目录，避免依赖某个具体路径（如
+        // Windows 下的 `C:\tmp`）是否存在。
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let config_dir = temp.path().join("cc-switch-config-override");
         let _env = ConfigDirEnvGuard::new(
             "CC_SWITCH_CONFIG_DIR",
-            Some("/tmp/cc-switch-config-override"),
+            Some(config_dir.to_str().expect("utf8 temp path")),
         );
         assert!(validate_config_dir().is_ok());
     }
@@ -967,6 +1065,9 @@ mod tests {
         assert!(validate_config_dir().is_err());
     }
 
+    // `/etc`、`/usr`、`/tmp` 是 Unix 一级系统目录；在 Windows 上这些输入解析为当前盘符根下的
+    // 路径，与 Unix 语义不同，因此这组用例只在 Unix 上有意义。
+    #[cfg(unix)]
     #[test]
     fn validate_config_dir_rejects_etc() {
         let _guard = lock_test_home_and_settings();
@@ -974,6 +1075,7 @@ mod tests {
         assert!(validate_config_dir().is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn validate_config_dir_rejects_usr() {
         let _guard = lock_test_home_and_settings();
@@ -981,11 +1083,109 @@ mod tests {
         assert!(validate_config_dir().is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn validate_config_dir_rejects_tmp() {
         let _guard = lock_test_home_and_settings();
         let _env = ConfigDirEnvGuard::new("CC_SWITCH_CONFIG_DIR", Some("/tmp"));
         assert!(validate_config_dir().is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn validate_config_dir_ok_for_drive_relative_child_dir() {
+        let _guard = lock_test_home_and_settings();
+        // 用一个真实存在的临时目录的父级，避免依赖 `C:\tmp` 是否存在。
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let config_dir = temp.path().join("cc-switch-config-override");
+        let _env = ConfigDirEnvGuard::new(
+            "CC_SWITCH_CONFIG_DIR",
+            Some(config_dir.to_str().expect("utf8 temp path")),
+        );
+        assert!(validate_config_dir().is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn validate_config_dir_rejects_windows_system_dirs() {
+        let _guard = lock_test_home_and_settings();
+        // 盘符根目录
+        for dir in ["C:\\", "D:\\"] {
+            if Path::new(dir).exists() {
+                let _env = ConfigDirEnvGuard::new("CC_SWITCH_CONFIG_DIR", Some(dir));
+                assert!(
+                    validate_config_dir().is_err(),
+                    "config dir should reject drive root {dir}"
+                );
+            }
+        }
+        // Windows 系统目录（仅当该目录真实存在时才断言）
+        let system_root = env::var("SYSTEMROOT").unwrap_or_else(|_| r"C:\Windows".to_string());
+        let candidates = [
+            system_root.clone(),
+            format!(r"{}\System32", system_root.trim_end_matches(['\\', '/'])),
+            env::var("PROGRAMFILES").unwrap_or_else(|_| r"C:\Program Files".to_string()),
+            env::var("PROGRAMFILES(X86)").unwrap_or_else(|_| r"C:\Program Files (x86)".to_string()),
+        ];
+        for dir in candidates {
+            if Path::new(&dir).exists() {
+                let _env = ConfigDirEnvGuard::new("CC_SWITCH_CONFIG_DIR", Some(&dir));
+                assert!(
+                    validate_config_dir().is_err(),
+                    "config dir should reject system dir {dir}"
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn is_system_dir_windows_semantics() {
+        // 与 is_system_dir_windows_matches_nested_system_root 共用锁，避免并行测试时
+        // 读到对方临时设置的 SYSTEMROOT 而误判。
+        let _guard = lock_test_home_and_settings();
+        // 盘符根 / 裸根：拒绝
+        assert!(is_system_dir(Path::new(r"C:\")));
+        assert!(is_system_dir(Path::new(r"D:\")));
+        assert!(is_system_dir(Path::new("/")));
+        // Windows 系统目录本体：拒绝（含 verbatim 形式，从真实 system root 派生盘符）
+        let system_root = env::var("SYSTEMROOT").unwrap_or_else(|_| r"C:\Windows".to_string());
+        assert!(is_system_dir(Path::new(&system_root)));
+        let drive_letter = system_root
+            .chars()
+            .next()
+            .filter(|c| c.is_ascii_alphabetic())
+            .map(|c| c.to_ascii_uppercase())
+            .unwrap_or('C');
+        let verbatim = format!(r"\\?\{drive_letter}:\Windows");
+        assert!(is_system_dir(Path::new(&verbatim)));
+        // 系统目录的子路径：拒绝
+        assert!(is_system_dir(Path::new(&format!(
+            r"{}\System32",
+            system_root.trim_end_matches(['\\', '/'])
+        ))));
+        // 盘符根相对的用户子目录：不误判
+        assert!(!is_system_dir(Path::new(r"C:\tmp\my-config")));
+        assert!(!is_system_dir(Path::new(r"C:\Users\me")));
+        assert!(!is_system_dir(Path::new("~")));
+        // 相对路径 / 盘符相对路径：不误判（由 resolve_config_dir 解析为绝对路径后再判）
+        assert!(!is_system_dir(Path::new(r"Windows\cc-switch")));
+        assert!(!is_system_dir(Path::new(r"C:Windows\cc-switch")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn is_system_dir_windows_matches_nested_system_root() {
+        // 定制安装（如 `D:\OS\Windows`）：按完整组件前缀比较，不能只看首组件。
+        let _guard = lock_test_home_and_settings();
+        let _env = ConfigDirEnvGuard::new("SYSTEMROOT", Some(r"D:\OS\Windows"));
+        assert!(is_system_dir(Path::new(r"D:\OS\Windows")));
+        assert!(is_system_dir(Path::new(r"D:\OS\Windows\System32")));
+        // 同盘符但前缀不同的普通目录：不误判
+        assert!(!is_system_dir(Path::new(r"D:\OS\unrelated")));
+        assert!(!is_system_dir(Path::new(r"D:\other\Windows")));
+        // 不同盘符：不匹配
+        assert!(!is_system_dir(Path::new(r"E:\OS\Windows")));
     }
 
     #[test]
