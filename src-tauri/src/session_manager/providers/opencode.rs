@@ -32,7 +32,7 @@ pub(crate) fn get_opencode_base_dir() -> PathBuf {
             return PathBuf::from(xdg).join("opencode");
         }
     }
-    dirs::home_dir()
+    crate::config::home_dir()
         .map(|h| h.join(".local/share/opencode"))
         .unwrap_or_else(|| PathBuf::from(".local/share/opencode"))
 }

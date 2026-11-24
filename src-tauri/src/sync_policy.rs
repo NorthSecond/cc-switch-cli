@@ -31,6 +31,6 @@ pub(crate) fn should_sync_live(app_type: &AppType) -> bool {
 
 fn get_openclaw_dir() -> std::path::PathBuf {
     crate::settings::get_openclaw_override_dir()
-        .or_else(|| dirs::home_dir().map(|home| home.join(".openclaw")))
+        .or_else(|| crate::config::home_dir().map(|home| home.join(".openclaw")))
         .unwrap_or_else(|| std::path::PathBuf::from(".openclaw"))
 }
